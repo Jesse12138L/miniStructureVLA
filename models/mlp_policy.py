@@ -28,7 +28,6 @@ class MLPPolicy(nn.Module):
         self.img_encoder = ImageEncoderTinyCNNSpatial(d_model, img_size)
         self.txt_encoder = TextEncoderTinyGRU(vocab_size, d_word=64, d_model=d_model)
         self.state_encoder = StateEncoderMLP(state_dim, d_model=d_model)
-        # LayerNorm after the first block keeps the fused embedding at a stable scale
         self.head = nn.Sequential(
             nn.Linear(3 * d_model, hidden),
             nn.ReLU(),

@@ -68,15 +68,12 @@ def main():
 
     device = torch.device(args.device if torch.cuda.is_available() else "cpu")
 
-    # load model + tokenizer
     print(f"[test] Loading checkpoint from {args.checkpoint}")
     model, tokenizer, resize_to, norm = load_policy(args.checkpoint, device)
 
-    # encode instruction
     instr_tokens = tokenizer.encode(args.instruction)
     text_ids = torch.tensor(instr_tokens, dtype=torch.long).unsqueeze(0).to(device)  # (1, T_text)
 
-    # environment
     env = MetaWorldMT1Wrapper(
         env_name=args.env_name,
         seed=args.seed,
@@ -137,7 +134,6 @@ def main():
 
             action_np = action_queue.pop(0)
 
-            # step environment
             img, state, reward, done, info = env.step(action_np)
             ep_reward += reward
             step += 1

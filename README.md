@@ -7,6 +7,8 @@ a few hundred lines you can read in one sitting.
 Derived from [keivalya/mini-vla](https://github.com/keivalya/mini-vla) (MIT, © 2025
 Keivalya Pandya). See [LICENSE](LICENSE).
 
+> 中文版见 [README.zh-CN.md](README.zh-CN.md).
+
 ## What it does
 
 ```

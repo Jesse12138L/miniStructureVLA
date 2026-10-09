@@ -68,9 +68,6 @@ def main():
         camera_name=args.camera_name,
     )
 
-    # Pin the environment's RNG before any episode is drawn. The values returned here
-    # are immediately overwritten by the loop's own reset() below - setting the seed is
-    # the entire point of this call, so do not remove it as "unused".
     obs, info = env.reset(seed=args.seed)
     policy = ENV_POLICY_MAP[args.env_name]()
 
@@ -79,12 +76,8 @@ def main():
     actions = []
     texts = []
 
-    # fixed instruction for this dataset
     instruction = args.instruction
 
-    # index one past the last step of each episode. The ACT policy samples an action
-    # chunk per step and that chunk must not run past the end of its episode, which
-    # the flat arrays alone cannot tell you.
     episode_ends = []
 
     for ep in range(args.episodes):
@@ -103,8 +96,6 @@ def main():
             action_raw = np.asarray(policy.get_action(obs), dtype=np.float32)
             action = np.clip(action_raw, env.action_space.low, env.action_space.high)
 
-            # log current transition; env.render() comes out vertically flipped, so
-            # flip it back (envs/metaworld_env.py applies the same flip for test.py)
             img = np.flipud(env.render()) # (H, W, 3) uint8
             state = extract_state(obs) # (state_dim,)
 
@@ -144,7 +135,6 @@ def main():
     states = np.stack(states, axis=0)   # (N, state_dim)
     actions = np.stack(actions, axis=0) # (N, action_dim)
 
-    # tokenize instructions
     tokenizer = SimpleTokenizer(vocab=None)
     tokenizer.build_from_texts(texts)
     text_ids_list = [tokenizer.encode(t) for t in texts]

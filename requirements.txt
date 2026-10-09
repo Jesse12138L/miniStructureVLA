@@ -18,6 +18,4 @@ imageio[ffmpeg]==2.38.0
 # --- configs (configs/*.yaml) ---
 pyyaml==6.0.3
 
-# Deliberately NOT required:
-#   einops       models/unet1d.py uses permute instead, to keep the U-Net readable
-#   torchvision  the image pipeline is plain convolutions plus cv2.resize
+

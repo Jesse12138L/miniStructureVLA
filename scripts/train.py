@@ -147,22 +147,14 @@ def main():
     action_dim = dataset.actions.shape[1]
 
     # Split by whole episode, not by step.
-    # Neighbouring frames of one demonstration are nearly identical, so a step-level
-    # split would scatter t into train and t+1 into val and the validation loss would
-    # measure memorisation rather than generalisation.
-    # `ends` holds the exclusive end index of each episode, so the start of an episode
-    # is the previous episode's end (with an implicit 0 for the first one).
     ends = np.asarray(dataset.episode_ends)
     starts = np.concatenate([[0], ends[:-1]])
     n_val_eps = max(1, int(round(len(ends) * train_cfg["val_split"])))
-    # Which episodes are validation, chosen with a fixed seed. A dedicated Generator is
-    # passed so this does not disturb the global RNG state.
     val_eps = set(torch.randperm(len(ends), generator=torch.Generator().manual_seed(0))
                   [:n_val_eps].tolist())
 
     train_idx, val_idx = [], []
     for ep, (start, end) in enumerate(zip(starts, ends)):
-        # whole-episode membership: each episode goes entirely to val or entirely to train
         (val_idx if ep in val_eps else train_idx).extend(range(int(start), int(end)))
     train_loader = DataLoader(Subset(dataset, train_idx),
                               batch_size=train_cfg["batch_size"], shuffle=True)
