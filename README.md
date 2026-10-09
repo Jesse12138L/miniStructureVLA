@@ -1,4 +1,4 @@
-# mini-VLA
+# miniStructureVLA
 
 A minimal, beginner-friendly **Vision-Language-Action** model: it takes a camera image,
 a text instruction and the robot's own state, and produces continuous robot actions.
@@ -6,14 +6,8 @@ a text instruction and the robot's own state, and produces continuous robot acti
 This is a teaching repo, not a research artifact. The model is ~350 lines of code — 817
 with the comments and docstrings — and it trains on a laptop GPU in well under an hour.
 
-> **Attribution.** This project is derived from
-> [keivalya/mini-vla](https://github.com/keivalya/mini-vla) (MIT, © 2025 Keivalya
-> Pandya), which built the original single-head VLA-diffusion policy along with the blog
-> series explaining it. This fork replaces the upstream `models/fusion.py` +
-> `models/diffusion_head.py` + `models/vla_diffusion_policy.py` with three
-> interchangeable action heads selected by YAML config, and adds the MLP / ACT /
-> Diffusion comparison in [Results](#results). The MIT licence and the upstream
-> copyright are retained in [LICENSE](LICENSE).
+> **Attribution.** Derived from [keivalya/mini-vla](https://github.com/keivalya/mini-vla)
+> (MIT, © 2025 Keivalya Pandya).
 
 ## What it does
 
@@ -47,11 +41,10 @@ pip install -r requirements.txt
 
 ## Run it
 
-> [!IMPORTANT]
-> **Run every script as a module (`python -m scripts.…`), from the repo root.**
-> The scripts import `from models…`, `from envs…` and `from utils…`, and those only
-> resolve when the repo root is on `sys.path`. Running `python scripts/train.py` fails
-> with `ModuleNotFoundError: No module named 'models'`.
+Run every script as a module (`python -m scripts.…`) from the repo root. The scripts
+import `from models…`, `from envs…` and `from utils…`, and those only resolve when the
+repo root is on `sys.path` — `python scripts/train.py` fails with
+`ModuleNotFoundError: No module named 'models'`.
 
 ### 1. Collect demonstrations
 
@@ -126,63 +119,13 @@ Images are rendered at `camera_name`, flipped vertically (`env.render()` comes o
 upside down), resized to `data.resize_to` (128 in all three configs) and scaled to
 `[0, 1]`.
 
-## Results
-
-`bin-picking-v3`, camera `corner3`, 100 episodes / 11.5k steps, 150 epochs, 50
-evaluation episodes on an RTX 3060 Laptop (6 GB):
-
-| | MLP | ACT | Diffusion |
-|---|---|---|---|
-| params | 413k | 1.31M | 67.6M |
-| train (150 ep) | 501 s | 1445 s | 1800 s |
-| evaluate (50 ep) | 24 s | 18 s | 611 s |
-| **success rate** | **96%** (48/50) | 64% (32/50) | 52% (26/50) |
-| first-action L1 vs expert | 0.006 | 0.047 | 0.111 |
-
-> [!NOTE]
-> The L1 row is only good for ranking, not as an absolute error. The MLP and ACT columns
-> are measured against the real expert actions in the dataset; the diffusion column could
-> not be reproduced that way and was measured against the MLP's closed-loop actions
-> instead. Both references give the same ordering — under the old clip setting, diffusion
-> scored 0.407 and 0.456 against the two — which is what makes the comparison usable.
-
-**The success rate tracks the first-action error and nothing else.** Parameter count and
-training time are uncorrelated with it — 413k parameters beat 67.6M, and 8 minutes of
-training beat 30. The scripted expert is a proportional feedback controller, so the
-demonstrations are single-valued and memoryless; a single-step regressor fits that
-almost exactly, while ACT's chunked open-loop execution and the diffusion head's
-stochastic sampling both work against it at this data scale.
-
-> [!NOTE]
-> `checkpoints/mlp_bp.pt` is not in the repo, so the 96% column cannot be reproduced
-> from a committed checkpoint. Retrain it with `configs/mlp_bin_picking.yaml` (~8
-> minutes) to reproduce it. Closed-loop success rates on 50 episodes carry roughly a
-> ±6 point confidence interval, so treat small gaps as noise.
-
-### A bug worth reading about: `clip_sample_range`
-
-The diffusion policy originally scored **0%** while its validation loss looked fine.
-The cause was a line copied from the reference implementation without its assumption:
-
-`real-stanford/diffusion_policy` normalises actions *by range* into `[-1, 1]`, so its
-`clip_sample_range=1.0` is self-consistent. This project uses z-score normalisation
-instead, which puts the actions near ±3 — and clipping to ±1 at every denoising step
-drags the whole trajectory inward. The symptom was subtle: the predicted action std came
-out 0.5–0.6× the true std, uniformly across all four dimensions, with no crash and no
-shape error. Raising the clip to `4.0` (effectively off — the data reaches ±3.1) took
-success from **0% to 52%**, with no retraining, since it is purely an inference-time
-change.
-
-The lesson generalises: **a constant copied from a reference implementation carries that
-implementation's normalisation assumptions with it.**
-
 ## Project layout
 
 ```
 configs/          one YAML per experiment; defines the whole run
 envs/
   metaworld_env.py    thin wrapper over MT1: returns (image, state), not raw obs
-  metaworld_mt1.py    standalone viewer for watching an expert drive a task
+  metaworld_mt1.py    viewer for watching an expert drive a task; lists all 50 tasks
 models/
   encoders.py         image CNN / text GRU / state MLP — the canonical conv trunk
   mlp_policy.py       action head 1
@@ -216,9 +159,11 @@ Roughly in order of difficulty:
 - **Run the masking ablation yourself.** Set `PRIVILEGED_STATE_SLICES = ()` in
   `utils/state_masking.py` and retrain. Handing the policy the object's coordinates is a
   direct test of whether the vision pathway is load-bearing.
-- **Add a task.** Any of Meta-World's 50 MT1 tasks has a scripted expert with the same
-  39-dim observation and 4-dim action, so a new task is a new `--env-name` plus a
-  config. `python -m envs.metaworld_mt1` will show you one before you commit to it.
+- **Change the task.** All 50 Meta-World MT1 tasks share the same 39-dim observation and
+  4-dim action, so switching task means changing `--env-name` and pointing a config at the
+  new dataset — no model code moves. `envs/metaworld_mt1.py` lists all 50 by category and
+  flags the multi-stage ones; run `python -m envs.metaworld_mt1` to watch one before
+  collecting from it.
 - **Swap the vision encoder** for CLIP or SigLIP features, which is where a VLA usually
   gets its language grounding from.
 - **Make the language mean something.** The instruction in this dataset is a single
