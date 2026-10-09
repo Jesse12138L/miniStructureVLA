@@ -32,14 +32,13 @@ class DiffusionSchedule(nn.Module):
     only buffers registered on a module are carried by `.to()`.
     """
 
-    # clip_sample_range is 1.0 in the reference implementation, because there the
-    # LinearNormalizer squashes actions *by range* into [-1, 1], so x0 is inside that
-    # box by construction. This project uses z-score normalisation instead, and the
-    # normalised actions sit around +-3, so clipping to +-1 shaves a slice off every
-    # dimension: measured, the predicted std came out 0.5-0.6x the true std and the L1
-    # was 4x worse than with clipping off. 4.0 is effectively no clipping (the data
-    # reaches +-3.1). The point of clipping is "do not leave the data range", and this
-    # value achieves that.
+    # The reference implementation uses 1.0, which is self-consistent there: its
+    # LinearNormalizer squashes actions into [-1, 1] *by range*, so x0 is inside that box
+    # by construction and a clip at 1.0 never bites. This project z-scores its actions
+    # instead, which spreads them over a much wider interval, so clipping at 1.0 would
+    # pull every denoising step back towards the box and distort the trajectory. 4.0 sits
+    # outside the z-scored range: the clip still catches a sample that diverges, without
+    # touching a well-behaved one.
     def __init__(self, num_train_timesteps=100, max_beta=0.999, clip_sample_range=4.0):
         super().__init__()
         self.T = num_train_timesteps

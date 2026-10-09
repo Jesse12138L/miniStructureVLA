@@ -19,11 +19,8 @@ model:
     n_action_steps: 8   # execute 8 of the 16 predicted steps, then re-plan (the
                         # reference's 16/8 split)
     # The reference uses [512, 1024, 2048], a 256M-parameter U-Net trained on millions of
-    # Robomimic frames. Half that width here:
-    #   conditioning vector 448 dims / 256 channels in the first stage = 1.8
-    #     (the reference sits at 0.79; an earlier [64, ...] was 7.0)
-    #   parameter density 5876 per frame, still below the reference's ~8500
-    #   training memory 1.4GB of 6GB, about 39 minutes for 200 epochs
+    # Robomimic frames. Half that width here, which keeps the 448-dim conditioning vector
+    # from swamping the first stage: 448/256 = 1.8, against 0.79 at the reference's width.
     down_dims: [256, 512, 1024]
     num_kp: 32          # spatial-softmax keypoints; the image feature is 2*num_kp wide
     step_embed_dim: 128
