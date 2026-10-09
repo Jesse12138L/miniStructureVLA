@@ -1,0 +1,21 @@
+# 单步 MLP 策略在 bin-picking-v3 上的配置，作为 ACT（93%）的对照。
+policy: mlp
+
+data:
+  dataset_path: data/bp_masked.npz
+  save_path: checkpoints/mlp_bp.pt
+  resize_to: 128
+  chunk_size: 1
+  normalize: true
+
+model:
+  d_model: 128
+  mlp:
+    hidden: 256
+
+train:
+  batch_size: 64
+  epochs: 200
+  lr: 1.0e-4
+  val_split: 0.1
+  device: cuda

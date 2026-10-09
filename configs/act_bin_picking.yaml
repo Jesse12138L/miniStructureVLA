@@ -1,0 +1,26 @@
+# ACT 策略，目标是把 bin-picking-v3 从 0~14% 提上去。
+policy: act
+
+data:
+  dataset_path: data/bp_masked.npz
+  save_path: checkpoints/act_bp.pt
+  resize_to: 128
+  chunk_size: 20        # 一次预测多少步。bp 单集约 116 步，原版的 100 会让多数 chunk 被 padding 填满
+  normalize: true       # state 和 action 做 z-score，统计量存进 checkpoint
+
+model:
+  d_model: 128          # 原版用 512，但数据只有 11.5k 步，那么宽会过拟合
+  act:
+    n_heads: 4          # d_model=128 下 8 头每头只剩 16 维
+    n_enc_layers: 2
+    dim_feedforward: 512  # 标准 4×；原版是 6.25×
+    latent_dim: 16        # VAE 隐变量。脚本专家多模态弱，原版的 32 偏大
+    kl_weight: 10.0       # 原版调过的值
+    # 解码器固定 1 层：原版设了 7 层，但因其 return_intermediate_dec 的 bug 只用了第 0 层
+
+train:
+  batch_size: 64
+  epochs: 200
+  lr: 1.0e-4            # 原版是 1e-5，那是给 80M 参数模型调的；这里约 120 万
+  val_split: 0.1
+  device: cuda

@@ -7,8 +7,8 @@ from metaworld.policies import ENV_POLICY_MAP
 
 seed = 42
 # ['corner', 'corner2', 'corner3', 'corner4', 'topview', 'behindGripper', 'gripperPOV']
-camera_name = 'corner'
-env_name = 'push-v3'
+camera_name = 'corner2'
+env_name = 'bin-picking-v3'
 env = gym.make(
     'Meta-World/MT1',
     env_name=env_name,

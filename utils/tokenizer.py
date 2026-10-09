@@ -24,5 +24,5 @@ class SimpleTokenizer:
         Encode a text into a list of ids.
         """
         toks = text.lower().split()
-        ids = [self.vocab.get(t, self.vocab[self.unk_token]) for t in toks]
+        ids = [self.vocab.get(t, self.vocab[self.unk_token]) for t in toks]# .get(t, 备用值)
         return ids

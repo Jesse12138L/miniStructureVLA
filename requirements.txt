@@ -14,6 +14,9 @@ opencv-python
 # misc
 tqdm
 
+# config files (configs/*.yaml)
+pyyaml
+
 # video deps
 imageio
 imageio[ffmpeg]

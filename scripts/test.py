@@ -1,101 +1,55 @@
-"""Test VLA Diffusion Policy on Meta-World MT1"""
+"""Evaluate a trained policy in a Meta-World MT1 environment."""
 
 import os
 import argparse
 import numpy as np
 import torch
+import cv2
 import imageio.v2 as imageio
 
 from envs.metaworld_env import MetaWorldMT1Wrapper
-from models.vla_diffusion_policy import VLADiffusionPolicy
+from models.build import build_policy
 from utils.tokenizer import SimpleTokenizer
+from utils.state_masking import mask_privileged_state
 
 
 def parse_args():
-    parser = argparse.ArgumentParser(description="Test VLA Diffusion Policy on Meta-World MT1")
-
-    parser.add_argument(
-        "--checkpoint",
-        type=str,
-        default="checkpoints/vla_diffusion_metaworld_push.pt",
-        help="Path to trained VLA diffusion checkpoint",
-    )
-    parser.add_argument(
-        "--env-name",
-        type=str,
-        default="push-v3",
-        help="Meta-World MT1 task name, e.g. push-v3, reach-v3, pick-place-v3",
-    )
-    parser.add_argument(
-        "--seed",
-        type=int,
-        default=42,
-        help="Random seed for the environment",
-    )
-    parser.add_argument(
-        "--episodes",
-        type=int,
-        default=5,
-        help="Number of evaluation episodes",
-    )
-    parser.add_argument(
-        "--max-steps",
-        type=int,
-        default=150,
-        help="Maximum steps per episode",
-    )
-    parser.add_argument(
-        "--instruction",
-        type=str,
-        default="push the object to the goal",
-        help="Language instruction passed to the VLA",
-    )
-    parser.add_argument(
-        "--device",
-        type=str,
-        default="cpu",
-        help="'cpu' or 'cuda'",
-    )
-    parser.add_argument(
-        "--save-video",
-        action="store_true",
-        help="If set, save each episode as an MP4 video",
-    )
-    parser.add_argument(
-        "--video-dir",
-        type=str,
-        default="videos",
-        help="Directory to save videos (if --save-video is set)",
-    )
-
+    parser = argparse.ArgumentParser(description="Evaluate a trained policy in Meta-World MT1")
+    parser.add_argument("--checkpoint", type=str, default="checkpoints/act_bp.pt")
+    parser.add_argument("--env-name", type=str, default="bin-picking-v3")
+    parser.add_argument("--camera-name", type=str, default="corner3",
+                        help="must match the camera the training data was collected with")
+    parser.add_argument("--instruction", type=str, default="push the object to the goal")
+    parser.add_argument("--seed", type=int, default=42)
+    parser.add_argument("--episodes", type=int, default=20)
+    parser.add_argument("--max-steps", type=int, default=200)
+    parser.add_argument("--device", type=str, default="cuda")
+    parser.add_argument("--save-video", action=argparse.BooleanOptionalAction, default=True)
+    parser.add_argument("--video-dir", type=str, default="videos")
+    parser.add_argument("--video-per-outcome", type=int, default=3,
+                        help="keep at most this many videos of each outcome")
     return parser.parse_args()
 
 
-def load_model_and_tokenizer(checkpoint_path: str, device: torch.device):
+def load_policy(checkpoint_path: str, device: torch.device):
+    """Rebuild the policy from the config the checkpoint carries, so this needs no
+    config file. Returns (model, tokenizer, resize_to, norm)."""
     ckpt = torch.load(checkpoint_path, map_location=device)
+    if "config" not in ckpt:
+        raise SystemExit(f"{checkpoint_path} predates the config format; "
+                         f"retrain it with scripts/train.py")
 
-    vocab = ckpt["vocab"]
-    state_dim = ckpt["state_dim"]
-    action_dim = ckpt["action_dim"]
-    d_model = ckpt["d_model"]
-    diffusion_T = ckpt["diffusion_T"]
-
-    vocab_size = max(vocab.values()) + 1
-
-    model = VLADiffusionPolicy(
-        vocab_size=vocab_size,
-        state_dim=state_dim,
-        action_dim=action_dim,
-        d_model=d_model,
-        diffusion_T=diffusion_T,
-    ).to(device)
-
+    cfg, vocab = ckpt["config"], ckpt["vocab"]
+    model = build_policy(cfg, max(vocab.values()) + 1, ckpt["state_dim"], ckpt["action_dim"])
+    model = model.to(device)
     model.load_state_dict(ckpt["model_state_dict"])
     model.eval()
 
-    tokenizer = SimpleTokenizer(vocab=vocab)
-
-    return model, tokenizer
+    norm = ({k: torch.tensor(v, device=device) for k, v in ckpt["norm_stats"].items()}
+            if ckpt["norm_stats"] else None)
+    print(f"[test] policy={cfg['policy']}  resize_to={cfg['data']['resize_to']}  "
+          f"chunk={cfg['data']['chunk_size']}")
+    return model, SimpleTokenizer(vocab=vocab), cfg["data"]["resize_to"], norm
 
 
 def main():
@@ -105,7 +59,7 @@ def main():
 
     # load model + tokenizer
     print(f"[test] Loading checkpoint from {args.checkpoint}")
-    model, tokenizer = load_model_and_tokenizer(args.checkpoint, device)
+    model, tokenizer, resize_to, norm = load_policy(args.checkpoint, device)
 
     # encode instruction
     instr_tokens = tokenizer.encode(args.instruction)
@@ -116,52 +70,99 @@ def main():
         env_name=args.env_name,
         seed=args.seed,
         render_mode="rgb_array",
-        camera_name="topview",
+        camera_name=args.camera_name,
     )
 
-    print(f"[test] Meta-World MT1 env: {args.env_name}")
+    print(f"[test] Meta-World MT1 env: {args.env_name} (camera: {args.camera_name})")
     print(f"[test] state_dim={env.state_dim}, action_dim={env.action_dim}, obs_shape={env.obs_shape}")
 
     if args.save_video:
         os.makedirs(args.video_dir, exist_ok=True)
 
     # evaluation
+    n_success = 0
+    saved_videos = {"success": 0, "fail": 0}
     for ep in range(args.episodes):
         img, state, info = env.reset()
         step = 0
         ep_reward = 0.0
+        ep_success = 0
 
         frames = [img.copy()]
 
+        # ACT predicts a chunk; plan once and feed the actions to the env one at a
+        # time, re-planning when the queue runs dry. A single-step policy puts one
+        # action in the queue, so the loop below is the same either way.
+        action_queue = []
+
         done = False
         while not done and step < args.max_steps:
-            img_t = torch.from_numpy(img).permute(2, 0, 1).float().unsqueeze(0) / 255.0  # (1, 3, H, W)
-            state_t = torch.from_numpy(state).float().unsqueeze(0) # (1, state_dim)
+            if not action_queue:
+                # resize to the resolution the policy was trained on; `img` stays
+                # full-resolution for the video frames
+                obs_img = img
+                if obs_img.shape[0] != resize_to or obs_img.shape[1] != resize_to:
+                    obs_img = cv2.resize(obs_img, (resize_to, resize_to))
 
-            img_t = img_t.to(device)
-            state_t = state_t.to(device)
+                img_t = torch.from_numpy(obs_img).permute(2, 0, 1).float().unsqueeze(0) / 255.0  # (1, 3, H, W)
 
-            # inference
-            with torch.no_grad():
-                action_t = model.act(img_t, text_ids, state_t)  # (1, action_dim)
-            action_np = action_t.squeeze(0).cpu().numpy()
+                obs_state = mask_privileged_state(state)
+                state_t = torch.from_numpy(obs_state).float().unsqueeze(0)  # (1, state_dim)
+
+                img_t = img_t.to(device)
+                state_t = state_t.to(device)
+                # normalise after the move: the stats live on the model's device
+                if norm is not None:
+                    state_t = (state_t - norm["state_mean"]) / norm["state_std"]
+
+                # inference
+                with torch.no_grad():
+                    action_t = model.act(img_t, text_ids, state_t)
+                chunk = action_t.squeeze(0).cpu().numpy()   # (chunk, action_dim)
+                if norm is not None:
+                    chunk = chunk * norm["action_std"].cpu().numpy() \
+                                  + norm["action_mean"].cpu().numpy()
+                action_queue = list(chunk if chunk.ndim > 1 else chunk[None])
+
+            action_np = action_queue.pop(0)
 
             # step environment
             img, state, reward, done, info = env.step(action_np)
             ep_reward += reward
             step += 1
 
+            # Meta-World signals task completion via info["success"], not via the env's
+            # terminate flag, so fold it into the loop condition. This mirrors the done
+            # check in scripts/collect_data.py.
+            if int(info.get("success", 0)) == 1:
+                ep_success = 1
+                done = True
+
             frames.append(img.copy())
 
-        print(f"[test] Episode {ep+1}/{args.episodes}: reward={ep_reward:.3f}, steps={step}")
+        n_success += ep_success
+        print(
+            f"[test] Episode {ep+1}/{args.episodes}: "
+            f"reward={ep_reward:.3f}, steps={step}, success={ep_success}"
+        )
 
-        # save video
-        if args.save_video:
-            video_path = os.path.join(args.video_dir, f"{args.env_name}_ep{ep+1:03d}.mp4")
+        # save video, but only the first few of each outcome so a long run does not
+        # dump one file per episode
+        outcome = "success" if ep_success else "fail"
+        if args.save_video and saved_videos[outcome] < args.video_per_outcome:
+            saved_videos[outcome] += 1
+            video_path = os.path.join(
+                args.video_dir, f"{args.env_name}_ep{ep+1:03d}_{outcome}.mp4")
             with imageio.get_writer(video_path, fps=20) as writer:
                 for f in frames:
                     writer.append_data(f)
-            print(f"[test] Saved video to {video_path}")
+            print(f"[test] Saved video to {video_path} "
+                  f"({outcome} {saved_videos[outcome]}/{args.video_per_outcome})")
+
+    print(
+        f"[test] Success rate: {n_success}/{args.episodes} "
+        f"= {100.0 * n_success / args.episodes:.1f}%"
+    )
 
     env.close()
     print("[test] Done.")

@@ -50,8 +50,9 @@ class MetaWorldMT1Wrapper:
         return np.asarray(state, dtype=np.float32)
 
     def _get_image(self):
-        img = self.env.render()
-        img = img.astype(np.uint8)
+        # render() comes out vertically flipped; scripts/collect_data.py applies the
+        # same flip, so training and evaluation see the same viewpoint
+        img = np.flipud(self.env.render()).astype(np.uint8)
         return img
 
     def reset(self, seed=None):
