@@ -22,7 +22,7 @@ def parse_args():
     parser.add_argument("--instruction", type=str, default="push the object to the goal")
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--episodes", type=int, default=20)
-    parser.add_argument("--max-steps", type=int, default=200)
+    parser.add_argument("--max-steps", type=int, default=250)
     parser.add_argument("--device", type=str, default="cuda")
     parser.add_argument("--save-video", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--video-dir", type=str, default="videos")
