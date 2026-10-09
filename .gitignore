@@ -1,26 +1,26 @@
-# 数据与模型权重：体积大，不进版本库
+# Data and model weights: too large for version control
 data/
 checkpoints/
 *.npz
 *.pt
 
-# 采集 / 评测录制的视频
+# Videos recorded by scripts/collect_data.py and scripts/test.py
+# (`videos*/` already covers videos_collect/)
 videos*/
-videos_collect/
 
 # Python
 __pycache__/
 *.py[cod]
 
-# MuJoCo 生成的日志
+# Logs written by MuJoCo
 MUJOCO_LOG.txt
 
-# LIBERO 资产（如需可另行下载）
+# LIBERO assets (download separately if you need them)
 LIBERO/
 
-# 编辑器与系统文件（个人配置，不进公共仓库）
+# Editor and OS files: personal configuration, not part of the project
 .vscode/
 .DS_Store
 
-# 运行日志
+# Run logs
 *.log

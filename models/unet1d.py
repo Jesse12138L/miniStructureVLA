@@ -1,12 +1,13 @@
 """1D U-Net used as the diffusion denoiser.
 
-Takes the noisy action sequence (B, horizon, action_dim) plus a conditioning vector,
-and predicts the noise that was added to it. 条件向量 = 时间步嵌入与观测特征拼接而成，
-送进每个残差块做 FiLM 调制（每通道一个 scale 和一个 bias）。
+Takes the noisy action sequence (B, horizon, action_dim) plus a conditioning vector and
+predicts the noise that was added to it. The conditioning vector is the timestep
+embedding concatenated with the observation features, and it is injected into every
+residual block as FiLM (one scale and one bias per channel).
 
-对比原版 diffusion_policy 的 conditional_unet1d.py + conv1d_components.py：结构一致，
-只是把 einops 换成 permute，并且去掉了原版里那个恒为假的 is_last 判断（等价于每段都
-上采样）。
+Compared with the reference diffusion_policy (conditional_unet1d.py +
+conv1d_components.py) the structure matches, except that einops is replaced by permute
+and the channel transitions are driven straight from `down_dims`.
 """
 
 import math
@@ -16,7 +17,8 @@ import torch.nn as nn
 
 
 class SinusoidalPosEmb(nn.Module):
-    """标准 transformer 式正弦位置编码，把整数时间步变成向量。"""
+    """The standard transformer-style sinusoidal encoding: an integer timestep becomes
+    a vector."""
 
     def __init__(self, dim):
         super().__init__()
@@ -26,16 +28,17 @@ class SinusoidalPosEmb(nn.Module):
         half = self.dim // 2
         freqs = torch.exp(torch.arange(half, device=t.device)
                           * -(math.log(10000) / (half - 1)))
-        args = t[:, None].float() * freqs[None]
+        args = t[:, None].float() * freqs[None]  # (B,1) * (1,half) -> (B,half)
         return torch.cat([args.sin(), args.cos()], dim=-1)
 
 
 class Conv1dBlock(nn.Module):
-    """Conv1d -> GroupNorm -> Mish。整套网络的基本单元。"""
+    """Conv1d -> GroupNorm -> Mish. The basic unit the whole network is built from."""
 
     def __init__(self, in_ch, out_ch, kernel_size, n_groups=8):
         super().__init__()
         self.block = nn.Sequential(
+            # padding = kernel_size // 2 leaves the sequence length unchanged
             nn.Conv1d(in_ch, out_ch, kernel_size, padding=kernel_size // 2),
             nn.GroupNorm(n_groups, out_ch),
             nn.Mish(),
@@ -46,29 +49,36 @@ class Conv1dBlock(nn.Module):
 
 
 class ConditionalResidualBlock1D(nn.Module):
-    """两个 Conv1dBlock 加残差连接，条件向量以 FiLM 方式注入两者之间。"""
+    """Two Conv1dBlocks with a residual connection, and the conditioning vector
+    injected between them as FiLM."""
 
     def __init__(self, in_ch, out_ch, cond_dim, kernel_size, n_groups=8):
         super().__init__()
         self.block1 = Conv1dBlock(in_ch, out_ch, kernel_size, n_groups)
         self.block2 = Conv1dBlock(out_ch, out_ch, kernel_size, n_groups)
-        # 输出两倍通道数，拆成 scale 和 bias
+        # emits twice the output channels; split into scale and bias
         self.cond_encoder = nn.Sequential(
             nn.Mish(),
             nn.Linear(cond_dim, out_ch * 2),
         )
+        # a 1x1 conv only when the channel count changes, so the residual lines up
         self.residual_conv = (nn.Conv1d(in_ch, out_ch, 1)
                               if in_ch != out_ch else nn.Identity())
 
-    def forward(self, x, cond):  # x: (B, C, T)，cond: (B, cond_dim)
+    def forward(self, x, cond):  # x: (B, C, T), cond: (B, cond_dim)
         out = self.block1(x)
-        scale, bias = self.cond_encoder(cond).chunk(2, dim=-1)  # 各 (B, out_ch)
-        out = out * scale[..., None] + bias[..., None]           # 沿时间轴广播
+        # chunk(2, dim=-1) splits the last axis in half: first half scale, second bias,
+        # each of shape (B, out_ch)
+        scale, bias = self.cond_encoder(cond).chunk(2, dim=-1)
+        # [..., None] makes them (B, out_ch, 1), which then broadcasts over time
+        out = out * scale[..., None] + bias[..., None]
         out = self.block2(out)
         return out + self.residual_conv(x)
 
 
 class Downsample1d(nn.Module):
+    """Halve the sequence length: a stride-2 conv, with padding 1 to keep it exact."""
+
     def __init__(self, dim):
         super().__init__()
         self.conv = nn.Conv1d(dim, dim, 3, stride=2, padding=1)
@@ -78,6 +88,13 @@ class Downsample1d(nn.Module):
 
 
 class Upsample1d(nn.Module):
+    """Double the sequence length.
+
+    A transposed conv with kernel 4, stride 2, padding 1. The kernel is 4 rather than 3
+    because that is what makes the output exactly twice the input, mirroring
+    Downsample1d - with kernel 3 the lengths would not line up with the skip tensors.
+    """
+
     def __init__(self, dim):
         super().__init__()
         self.conv = nn.ConvTranspose1d(dim, dim, 4, stride=2, padding=1)
@@ -87,54 +104,62 @@ class Upsample1d(nn.Module):
 
 
 class ConditionalUnet1D(nn.Module):
-    """三段结构：down（残差块 + 下采样）→ mid（残差块）→ up（拼 skip + 上采样）。
+    """Three stages: down (residual blocks + downsample) -> mid (residual blocks) ->
+    up (concatenate skip + upsample).
 
-    对外张量是 (B, horizon, input_dim)；卷积要求通道优先，所以内部转成
-    (B, input_dim, horizon)，最后再转回来。
+    The tensor it exposes is (B, horizon, input_dim); convolutions want channels first,
+    so internally it becomes (B, input_dim, horizon) and is turned back at the end.
+
+    With horizon=16 and three down stages the length goes 16 -> 8 -> 4 (the last down
+    stage does not downsample), the mid blocks run at length 4, and the up path brings
+    it back 4 -> 8 -> 16.
     """
 
     def __init__(self, input_dim, global_cond_dim, down_dims=(64, 128, 256),
                  step_embed_dim=128, kernel_size=5, n_groups=8):
         super().__init__()
-        # 列表拼接： [4] + [256, 512, 1024]  →  [4, 256, 512, 1024]
+        # channel count per stage: [action_dim] + down_dims, e.g. [4, 256, 512, 1024]
         dims = [input_dim] + list(down_dims)
+        # consecutive pairs: (4,256), (256,512), (512,1024)
         pairs = list(zip(dims[:-1], dims[1:]))
 
+        # the timestep is widened and narrowed again, like a small MLP over the encoding
         self.step_encoder = nn.Sequential(
             SinusoidalPosEmb(step_embed_dim),
             nn.Linear(step_embed_dim, step_embed_dim * 4),
             nn.Mish(),
             nn.Linear(step_embed_dim * 4, step_embed_dim),
         )
+        # what every residual block is conditioned on: timestep + observation features
         cond_dim = step_embed_dim + global_cond_dim
 
         def block(in_ch, out_ch):
             return ConditionalResidualBlock1D(in_ch, out_ch, cond_dim,
                                               kernel_size, n_groups)
 
-        # 最后一段不再下采样
         self.down = nn.ModuleList()
         for i, (a, b) in enumerate(pairs):
             is_last = (i == len(pairs) - 1)
             self.down.append(nn.ModuleList([
-                block(a, b),                                     # 把通道数从 a 改成 b
-                block(b, b),                                     # 同宽度再加工一次
-                nn.Identity() if is_last else Downsample1d(b),   # 最后一段不下采样
+                block(a, b),                                     # change width from a to b
+                block(b, b),                                     # process again at that width
+                nn.Identity() if is_last else Downsample1d(b),   # last stage keeps its length
             ]))
 
         mid_dim = dims[-1]
         self.mid = nn.ModuleList([block(mid_dim, mid_dim), block(mid_dim, mid_dim)])
 
-        # 每段先拼接 skip（通道数翻倍）再上采样，与 down 的两段下采样对称
+        # each up stage concatenates the skip first (doubling the channels), then
+        # upsamples - mirroring the two real downsamples on the way down
         self.up = nn.ModuleList()
         for a, b in reversed(pairs[1:]):
             self.up.append(nn.ModuleList([
-                block(b * 2, a),    # 先接住 skip：通道翻倍成 2b，再压回 a
-                block(a, a),        # 同宽度再加工一次
-                Upsample1d(a),      # 上采样，与 down 的下采样一一对称
+                block(b * 2, a),    # catch the skip: 2b channels, squeezed back to a
+                block(a, a),        # process again at that width
+                Upsample1d(a),      # upsample, one-to-one with the down path
             ]))
 
-        # up 路径最后一段输出的是 down_dims[0] 个通道，最后再用 1×1 卷积投回动作维度
+        # the up path ends at down_dims[0] channels; a 1x1 conv maps back to actions
         start_dim = down_dims[0]
         self.final = nn.Sequential(
             Conv1dBlock(start_dim, start_dim, kernel_size, n_groups),
@@ -142,10 +167,13 @@ class ConditionalUnet1D(nn.Module):
         )
 
     def forward(self, sample, timestep, global_cond):
-        """sample: (B, horizon, input_dim) -> 同样形状的预测噪声"""
+        """sample: (B, horizon, input_dim) -> predicted noise, same shape"""
+        # to channels-first. permute returns a non-contiguous view, which Conv1d accepts
+        # fine - add .contiguous() here if you ever need to .view() the result.
         x = sample.permute(0, 2, 1)
         cond = torch.cat([self.step_encoder(timestep), global_cond], dim=-1)
 
+        # one skip connection per down stage, pushed shallow to deep
         skips = []
         for block1, block2, down in self.down:
             x = block1(x, cond)
@@ -157,6 +185,8 @@ class ConditionalUnet1D(nn.Module):
             x = block(x, cond)
 
         for block1, block2, up in self.up:
+            # skips is a LIFO stack: the down path pushed shallow to deep, so pop()
+            # hands back the deepest pending skip - the one this up stage matches
             x = torch.cat([x, skips.pop()], dim=1)
             x = block1(x, cond)
             x = block2(x, cond)

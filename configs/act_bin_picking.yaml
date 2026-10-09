@@ -1,26 +1,32 @@
-# ACT 策略，目标是把 bin-picking-v3 从 0~14% 提上去。
+# ACT policy on bin-picking-v3. See configs/mlp_bin_picking.yaml for the shared setup.
 policy: act
 
 data:
   dataset_path: data/bp_masked.npz
   save_path: checkpoints/act_bp.pt
   resize_to: 128
-  chunk_size: 20        # 一次预测多少步。bp 单集约 116 步，原版的 100 会让多数 chunk 被 padding 填满
-  normalize: true       # state 和 action 做 z-score，统计量存进 checkpoint
+  chunk_size: 20        # actions predicted *and executed* per plan. A bin-picking episode
+                        # runs ~116 steps, so the reference's 100 would leave most chunks
+                        # filled entirely with padding
+  normalize: true       # z-score state and actions; the statistics go in the checkpoint
 
 model:
-  d_model: 128          # 原版用 512，但数据只有 11.5k 步，那么宽会过拟合
+  d_model: 128          # the reference uses 512, but there are only 11.5k steps here and
+                        # that width overfits
   act:
-    n_heads: 4          # d_model=128 下 8 头每头只剩 16 维
+    n_heads: 4          # at d_model=128, 8 heads would leave only 16 dims per head
     n_enc_layers: 2
-    dim_feedforward: 512  # 标准 4×；原版是 6.25×
-    latent_dim: 16        # VAE 隐变量。脚本专家多模态弱，原版的 32 偏大
-    kl_weight: 10.0       # 原版调过的值
-    # 解码器固定 1 层：原版设了 7 层，但因其 return_intermediate_dec 的 bug 只用了第 0 层
+    dim_feedforward: 512  # the usual 4x; the reference uses 6.25x
+    latent_dim: 16        # VAE latent. The scripted expert is close to unimodal, so the
+                          # reference's 32 is oversized
+    kl_weight: 10.0       # the value the reference settled on
+    # The decoder is fixed at 1 layer. The reference configures 7 but only ever uses
+    # layer 0, because of its return_intermediate_dec bug.
 
 train:
   batch_size: 64
-  epochs: 200
-  lr: 1.0e-4            # 原版是 1e-5，那是给 80M 参数模型调的；这里约 120 万
+  epochs: 150
+  lr: 1.0e-4            # the reference's 1e-5 is tuned for an 80M-parameter model; this
+                        # one has ~1.2M
   val_split: 0.1
   device: cuda

@@ -1,8 +1,12 @@
 """Train a policy from a YAML config in configs/.
 
 The config defines the experiment; the CLI only carries two run-level overrides. The
-whole config goes into the checkpoint, so scripts/test.py can rebuild the model
-without needing the config file.
+whole config goes into the checkpoint, so scripts/test.py can rebuild the model without
+needing the config file.
+
+Run it as a module, from the repo root:
+
+    python -m scripts.train --config configs/mlp_bin_picking.yaml
 """
 
 import argparse
@@ -14,6 +18,7 @@ import torch
 from torch.utils.data import DataLoader, Dataset, Subset
 
 from models.build import build_policy
+from utils.chunking import episode_end_per_step, padded_action_chunk
 from utils.config import load
 from utils.ema import EMA
 
@@ -39,7 +44,7 @@ class TrainingDataset(Dataset):
         ends = data["episode_ends"] if "episode_ends" in data else self._infer_ends()
         self.episode_ends = ends
         # per-step lookup: the exclusive end of the episode each step belongs to
-        self.ep_end_of = np.repeat(ends, np.diff(np.append([0], ends)))
+        self.ep_end_of = episode_end_per_step(ends)
 
         try:
             import cv2
@@ -48,9 +53,14 @@ class TrainingDataset(Dataset):
             self.cv2 = None
 
     def _infer_ends(self):
-        """Datasets without episode_ends. The observation is frame-stacked and the env
-        seeds _prev_obs with the current frame on reset, so each episode's first step
-        has obs[0:4] == obs[18:22]."""
+        """Recover episode boundaries for a dataset that has no `episode_ends`.
+
+        scripts/collect_data.py always writes them, so this path is not normally taken;
+        it exists so an older or hand-built .npz degrades instead of crashing. The trick
+        is that the observation is frame-stacked and the env seeds its "previous frame"
+        with the current one on reset, so the first step of an episode has
+        obs[0:4] == obs[18:22]. That holds for Meta-World and not much else.
+        """
         starts = np.flatnonzero(np.all(self.states[:, 0:4] == self.states[:, 18:22], axis=1))
         print(f"[train] no 'episode_ends' in the dataset; recovered {len(starts)} episodes")
         return np.append(starts[1:], len(self.states))
@@ -64,13 +74,8 @@ class TrainingDataset(Dataset):
             img = self.cv2.resize(img, (self.resize_to, self.resize_to))
         img = torch.from_numpy(img).permute(2, 0, 1).float() / 255.0  # (3, H, W)
 
-        stop = min(idx + self.chunk_size, self.ep_end_of[idx])
-        chunk = self.actions[idx:stop]
-        is_pad = np.zeros(self.chunk_size, dtype=bool)
-        is_pad[len(chunk):] = True
-        if len(chunk) < self.chunk_size:
-            chunk = np.concatenate(
-                [chunk, np.zeros((self.chunk_size - len(chunk), chunk.shape[1]), chunk.dtype)])
+        chunk, is_pad = padded_action_chunk(self.actions, idx, self.chunk_size,
+                                            self.ep_end_of[idx])
 
         return (img,
                 torch.from_numpy(self.states[idx]).float(),
@@ -80,10 +85,11 @@ class TrainingDataset(Dataset):
 
 
 def norm_stats(dataset, indices, device):
-    """z-score statistics from the training split only.
+    """z-score statistics, computed from the training split only.
 
     Masked state dims are constant zero, so their std is 0 and dividing by it would
-    give NaN, hence the floor."""
+    give NaN, hence the floor.
+    """
     s = dataset.states[indices].astype(np.float64)
     a = dataset.actions[indices].astype(np.float64)
     return {
@@ -94,7 +100,7 @@ def norm_stats(dataset, indices, device):
     }
 
 
-def batch_loss(model, cfg, batch, device, norm):
+def batch_loss(model, batch, device, norm):
     """Move a batch to the device, normalise it, and run the policy's loss."""
     img, state, chunk, is_pad, text_ids = [t.to(device) for t in batch]
     if norm is not None:
@@ -105,13 +111,13 @@ def batch_loss(model, cfg, batch, device, norm):
     return model.loss(img, text_ids, state, chunk, is_pad)
 
 
-def evaluate(model, loader, cfg, device, norm):
-    """在验证集上跑一遍平均损失。"""
+def evaluate(model, loader, device, norm):
+    """Mean loss over the validation set."""
     model.eval()
     total = 0.0
     with torch.no_grad():
         for batch in loader:
-            total += batch_loss(model, cfg, batch, device, norm).item() * batch[0].size(0)
+            total += batch_loss(model, batch, device, norm).item() * batch[0].size(0)
     return total / max(len(loader.dataset), 1)
 
 
@@ -140,31 +146,35 @@ def main():
     state_dim = dataset.states.shape[1]
     action_dim = dataset.actions.shape[1]
 
-    # 按「整集」划分，而不是按「单步」划分。
-    # 同一次演示里相邻两帧几乎一模一样，按步划分会把 t 和 t+1 分到两边：
-    # 每集的结束下标（排他性），如ends = [104, 255, 360, 465, 565, 688, 788, 910, 1033，...]  共 100 个
-    ends = np.asarray(dataset.episode_ends)   
-    # ends[:-1]丢掉最后一个 → [104, 255, 360, 465, ..., 10333]
-    # [[0], ends[:-1]]前面加一个 [0] → [[0], [104, 255, 360, ...]]
-    # np.concatenate(...)拼成一个数组
+    # Split by whole episode, not by step.
+    # Neighbouring frames of one demonstration are nearly identical, so a step-level
+    # split would scatter t into train and t+1 into val and the validation loss would
+    # measure memorisation rather than generalisation.
+    # `ends` holds the exclusive end index of each episode, so the start of an episode
+    # is the previous episode's end (with an implicit 0 for the first one).
+    ends = np.asarray(dataset.episode_ends)
     starts = np.concatenate([[0], ends[:-1]])
-    n_val_eps = max(1, int(round(len(ends) * train_cfg["val_split"])))  # 验证集占几「集」，至少 1 集
+    n_val_eps = max(1, int(round(len(ends) * train_cfg["val_split"])))
+    # Which episodes are validation, chosen with a fixed seed. A dedicated Generator is
+    # passed so this does not disturb the global RNG state.
     val_eps = set(torch.randperm(len(ends), generator=torch.Generator().manual_seed(0))
-                  [:n_val_eps].tolist())      # 固定种子抽出 n_val_eps 个集号；
-                                              # 用独立的 Generator，避免污染全局随机状态
+                  [:n_val_eps].tolist())
 
-    train_idx, val_idx = [], [] # 装训练集和验证集的下标（两个独立的列表）
+    train_idx, val_idx = [], []
     for ep, (start, end) in enumerate(zip(starts, ends)):
-        # 整集登记：这一集被抽中就整集进验证集，否则整集进训练集
+        # whole-episode membership: each episode goes entirely to val or entirely to train
         (val_idx if ep in val_eps else train_idx).extend(range(int(start), int(end)))
-    train_loader = DataLoader(Subset(dataset, train_idx), batch_size=train_cfg["batch_size"], shuffle=True) # 训练要打乱顺序
-    val_loader = DataLoader(Subset(dataset, val_idx), batch_size=train_cfg["batch_size"]) # 验证只求和，不必打乱
+    train_loader = DataLoader(Subset(dataset, train_idx),
+                              batch_size=train_cfg["batch_size"], shuffle=True)
+    val_loader = DataLoader(Subset(dataset, val_idx),
+                            batch_size=train_cfg["batch_size"])
 
     norm = norm_stats(dataset, train_idx, device) if data["normalize"] else None
 
     model = build_policy(cfg, vocab_size, state_dim, action_dim).to(device)
     optimizer = torch.optim.Adam(model.parameters(), lr=train_cfg["lr"])
-    # 影子权重：验证和选模型都用它，原版 diffusion policy 就是这么做的
+    # Shadow weights: validation and model selection both use them, as the reference
+    # diffusion policy does.
     ema = EMA(model, power=train_cfg["ema_power"]) if train_cfg.get("use_ema") else None
     print(f"policy={cfg['policy']}  params={sum(p.numel() for p in model.parameters()):,}  "
           f"train={len(train_idx)}  val={len(val_idx)}  ema={ema is not None}  device={device}")
@@ -174,7 +184,7 @@ def main():
         model.train()
         train_total = 0.0
         for batch in train_loader:
-            loss = batch_loss(model, cfg, batch, device, norm)
+            loss = batch_loss(model, batch, device, norm)
             optimizer.zero_grad()
             loss.backward()
             optimizer.step()
@@ -183,7 +193,7 @@ def main():
             train_total += loss.item() * batch[0].size(0)
 
         eval_model = ema.model if ema is not None else model
-        val_loss = evaluate(eval_model, val_loader, cfg, device, norm)
+        val_loss = evaluate(eval_model, val_loader, device, norm)
         # keep the best epoch rather than the last: closed-loop success is noisy
         if val_loss < best_val:
             best_val, best_epoch = val_loss, epoch + 1
@@ -192,13 +202,13 @@ def main():
             line = (f"epoch {epoch+1:4d}/{train_cfg['epochs']}  "
                     f"train={train_total / max(len(train_idx), 1):.4f}  "
                     f"val={val_loss:.4f}  best={best_val:.4f}@{best_epoch}")
-            if ema is not None:  # 顺便看 EMA 到底有没有用
-                line += f"  (raw val={evaluate(model, val_loader, cfg, device, norm):.4f})"
+            if ema is not None:  # also score the raw weights, to see whether EMA helps
+                line += f"  (raw val={evaluate(model, val_loader, device, norm):.4f})"
             print(line)
 
     torch.save(
         {
-            # 存的是 EMA 权重，scripts/test.py 直接拿它评测
+            # the EMA weights are what gets evaluated, and what scripts/test.py reads
             "model_state_dict": best_state,
             "raw_state_dict": model.state_dict(),
             "vocab": dataset.vocab,

@@ -8,12 +8,18 @@ what makes it a baseline worth comparing against.
 
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
 
 from .encoders import ImageEncoderTinyCNNSpatial, StateEncoderMLP, TextEncoderTinyGRU
+from .losses import masked_l1_loss
 
 
 class MLPPolicy(nn.Module):
+    """One observation -> one action chunk, in a single forward pass.
+
+    With chunk_size=1 (the setting in configs/mlp_bin_picking.yaml) this is a plain
+    single-step regressor: every environment step re-plans from scratch.
+    """
+
     def __init__(self, vocab_size, state_dim, action_dim, chunk_size=1, d_model=128,
                  img_size=64, hidden=256):
         super().__init__()
@@ -33,6 +39,7 @@ class MLPPolicy(nn.Module):
         )
 
     def _embed(self, image, text_ids, state):
+        """Run the three encoders and concatenate them into one (B, 3 * d_model)."""
         return torch.cat([self.img_encoder(image),
                           self.txt_encoder(text_ids),
                           self.state_encoder(state)], dim=-1)
@@ -41,19 +48,14 @@ class MLPPolicy(nn.Module):
         """
         chunk:  (B, chunk_size, action_dim), zero-padded at the end of an episode
         is_pad: (B, chunk_size) bool, True on that padding
-
-        L1 rather than MSE because the gripper dimension is effectively bimodal - it
-        is open or closed, never in between - and the mean of two modes is a value
-        the robot is never commanded to hold.
         """
         pred = self.head(self._embed(image, text_ids, state))
-        pred = pred.view(-1, self.chunk_size, self.action_dim)
-        valid = ~is_pad.unsqueeze(-1)
-        err = F.l1_loss(pred, chunk, reduction='none') * valid
-        return err.sum() / (valid.sum() * self.action_dim).clamp(min=1)
+        # the head emits (B, chunk_size * action_dim); reshape splits it back into steps
+        pred = pred.reshape(-1, self.chunk_size, self.action_dim)
+        return masked_l1_loss(pred, chunk, is_pad)
 
     @torch.no_grad()
     def act(self, image, text_ids, state):
         self.eval()
         pred = self.head(self._embed(image, text_ids, state))
-        return pred.view(-1, self.chunk_size, self.action_dim)
+        return pred.reshape(-1, self.chunk_size, self.action_dim)

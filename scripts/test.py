@@ -1,14 +1,21 @@
-"""Evaluate a trained policy in a Meta-World MT1 environment."""
+"""Evaluate a trained policy in a Meta-World MT1 environment.
+
+Run it as a module, from the repo root, against a checkpoint from scripts/train.py:
+
+    python -m scripts.test --checkpoint checkpoints/act_bp.pt --episodes 5
+
+The checkpoint carries the config it was trained with, so no config file is needed here.
+"""
 
 import os
 import argparse
-import numpy as np
 import torch
 import cv2
 import imageio.v2 as imageio
 
 from envs.metaworld_env import MetaWorldMT1Wrapper
 from models.build import build_policy
+from utils.chunking import action_queue_from_chunk
 from utils.tokenizer import SimpleTokenizer
 from utils.state_masking import mask_privileged_state
 
@@ -19,12 +26,16 @@ def parse_args():
     parser.add_argument("--env-name", type=str, default="bin-picking-v3")
     parser.add_argument("--camera-name", type=str, default="corner3",
                         help="must match the camera the training data was collected with")
-    parser.add_argument("--instruction", type=str, default="push the object to the goal")
+    parser.add_argument("--instruction", type=str, default="push the object to the goal",
+                        help="must match the instruction the training data was collected "
+                             "with; the tokenizer and the policy were both fit to it")
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--episodes", type=int, default=20)
     parser.add_argument("--max-steps", type=int, default=250)
-    parser.add_argument("--device", type=str, default="cuda")
-    parser.add_argument("--save-video", action=argparse.BooleanOptionalAction, default=True)
+    parser.add_argument("--device", type=str, default="cuda",
+                        help="falls back to cpu when cuda is not available")
+    parser.add_argument("--save-video", action=argparse.BooleanOptionalAction, default=True,
+                        help="record the first few episodes; pass --no-save-video to skip")
     parser.add_argument("--video-dir", type=str, default="videos")
     parser.add_argument("--video-per-outcome", type=int, default=3,
                         help="keep at most this many videos of each outcome")
@@ -122,7 +133,7 @@ def main():
                 if norm is not None:
                     chunk = chunk * norm["action_std"].cpu().numpy() \
                                   + norm["action_mean"].cpu().numpy()
-                action_queue = list(chunk if chunk.ndim > 1 else chunk[None])
+                action_queue = action_queue_from_chunk(chunk)
 
             action_np = action_queue.pop(0)
 

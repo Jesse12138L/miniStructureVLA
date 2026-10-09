@@ -1,4 +1,13 @@
-"""Collect demonstration data from Meta-World MT1 environments using expert policies"""
+"""Collect demonstration data from a Meta-World MT1 environment using its expert policy.
+
+The expert is Meta-World's own scripted controller (metaworld.policies.ENV_POLICY_MAP),
+so the demonstrations are close to optimal and no human teleoperation is involved.
+
+Run it as a module, from the repo root:
+
+    python -m scripts.collect_data --env-name bin-picking-v3 --camera-name corner3 \\
+        --episodes 100 --max-steps 200 --output-path data/bp_masked.npz
+"""
 
 import os
 import argparse
@@ -28,8 +37,9 @@ def parse_args():
     parser.add_argument("--instruction", type=str, default="push the object to the goal",
                         help="Fixed instruction for all episodes")
     parser.add_argument("--save-video", action=argparse.BooleanOptionalAction, default=True,
-                        help="Record the first --video-episodes episodes to MP4 "
-                             "(on by default; disable with --no-save-video)")
+                        help="Record the first --video-episodes episodes to MP4. Both "
+                             "--save-video and --no-save-video are accepted; it is on "
+                             "by default")
     parser.add_argument("--video-dir", type=str, default="videos_collect",
                         help="Directory for recorded videos (used with --save-video). "
                              "Kept separate from scripts/test.py's outputs")
@@ -58,6 +68,9 @@ def main():
         camera_name=args.camera_name,
     )
 
+    # Pin the environment's RNG before any episode is drawn. The values returned here
+    # are immediately overwritten by the loop's own reset() below - setting the seed is
+    # the entire point of this call, so do not remove it as "unused".
     obs, info = env.reset(seed=args.seed)
     policy = ENV_POLICY_MAP[args.env_name]()
 
@@ -150,7 +163,7 @@ def main():
         episode_ends=np.asarray(episode_ends, dtype=np.int64),
     )
 
-    print("Saved Meta-World push dataset to", args.output_path)
+    print(f"Saved Meta-World {args.env_name} dataset to", args.output_path)
     print("  images:", images.shape)
     print("  states:", states.shape)
     print("  actions:", actions.shape)

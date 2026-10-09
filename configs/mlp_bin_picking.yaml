@@ -1,12 +1,14 @@
-# 单步 MLP 策略在 bin-picking-v3 上的配置，作为 ACT（93%）的对照。
+# Single-step MLP policy on bin-picking-v3.
+# It shares the dataset, the encoders and the normalisation with the ACT and Diffusion
+# configs, so the action head is the only variable between the three runs.
 policy: mlp
 
 data:
   dataset_path: data/bp_masked.npz
   save_path: checkpoints/mlp_bp.pt
   resize_to: 128
-  chunk_size: 1
-  normalize: true
+  chunk_size: 1         # one action per forward pass: the policy re-plans every step
+  normalize: true       # z-score state and actions; the statistics go in the checkpoint
 
 model:
   d_model: 128
@@ -15,7 +17,7 @@ model:
 
 train:
   batch_size: 64
-  epochs: 200
+  epochs: 150
   lr: 1.0e-4
   val_split: 0.1
   device: cuda

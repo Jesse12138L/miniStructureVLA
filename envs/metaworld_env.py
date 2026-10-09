@@ -1,13 +1,29 @@
 import gymnasium as gym
 import numpy as np
+# imported for its side effect: it registers the 'Meta-World/MT1' gym id
 import metaworld
 
+
 class MetaWorldMT1Wrapper:
+    """A thin adapter that turns a Meta-World MT1 env into (image, state) pairs.
+
+        reset(seed=None)  -> (image, state, info)
+        step(action)      -> (image, state, reward, done, info)
+        close()
+
+    Three things worth knowing before using it:
+
+    * `done` reflects only the env's truncate/terminate flags. Meta-World reports task
+      success through info["success"] and does *not* terminate the episode when the task
+      succeeds, so waiting on `done` alone runs every episode to the step limit. Both
+      callers (scripts/collect_data.py, scripts/test.py) add the success check
+      themselves.
+    * Constructing the wrapper already resets the env once and renders a frame, to
+      measure state_dim / action_dim / obs_shape. Construction has side effects.
+    * The state comes back raw and unmasked. Which fields the policy may see is decided
+      by utils/state_masking.py at the call sites.
     """
-    Wraps a Metaworld MT1 environment into a simple interface:
-    - reset() -> (image, state)
-    - step(action) -> (image, state, reward, done, info)
-    """
+
     def __init__(self, env_name='push-v3', seed=42, render_mode='rgb_array', camera_name='topview'):
         self.env = gym.make(
             'Meta-World/MT1',
@@ -18,17 +34,18 @@ class MetaWorldMT1Wrapper:
         )
         self.render_mode = render_mode
 
+        # one reset and one render purely to read the shapes off the env
         obs, _ = self.env.reset()
         self.state_dim = self._extract_state(obs).shape[0]
         self.action_dim = self.env.action_space.shape[0]
         self.obs_shape = self._get_image().shape
 
     def _extract_state(self, obs):
-        """
-        Adapt this to your env's observation structure.
-        Examples:
-          - obs might be a dict with keys ["robot_state", "object_state"].
-          - or it might already be a flat vector.
+        """Turn whatever the env calls an observation into a flat float32 vector.
+
+        MT1 hands back a plain array, which is the branch actually taken here. The dict
+        branches are kept for Meta-World variants that split the observation into
+        robot_state / object_state.
         """
         if isinstance(obs, dict):
             if "observation" in obs:
@@ -50,18 +67,29 @@ class MetaWorldMT1Wrapper:
         return np.asarray(state, dtype=np.float32)
 
     def _get_image(self):
-        # render() comes out vertically flipped; scripts/collect_data.py applies the
-        # same flip, so training and evaluation see the same viewpoint
+        """Render one frame as uint8 HWC.
+
+        render() comes out vertically flipped, so it is flipped back here;
+        scripts/collect_data.py applies the same flip. A disagreement between the two
+        would train and evaluate the policy on mirrored images, silently.
+        """
         img = np.flipud(self.env.render()).astype(np.uint8)
         return img
 
     def reset(self, seed=None):
+        """Returns (image, state, info). `seed=None` means "do not reseed"."""
         obs, info = self.env.reset(seed=seed)
         state = self._extract_state(obs)
         image = self._get_image()
         return image, state, info
 
     def step(self, action):
+        """Returns (image, state, reward, done, info).
+
+        The raw gym tuple is (obs, reward, truncate, terminate, info); the two done
+        flags are fused into a single `done` here, which is why the order looks
+        different. See the class docstring about `done` not covering success.
+        """
         obs, reward, truncate, terminate, info = self.env.step(action)
         done = truncate or terminate
         state = self._extract_state(obs)

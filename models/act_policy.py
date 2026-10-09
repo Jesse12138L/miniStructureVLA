@@ -18,9 +18,12 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 from .encoders import StateEncoderMLP, TextEncoderTinyGRU
+from .losses import masked_l1_loss
 
 
 def make_encoder(d_model, n_heads, dim_feedforward, dropout, n_layers):
+    """A standard transformer encoder, used both for the policy's observation encoder
+    and for the VAE."""
     layer = nn.TransformerEncoderLayer(d_model, n_heads, dim_feedforward, dropout,
                                        batch_first=True)
     return nn.TransformerEncoder(layer, n_layers)
@@ -38,6 +41,7 @@ class ACTPolicy(nn.Module):
         # Image tokens: the same convolutions as the MLP policy, but each spatial
         # location stays its own token instead of being flattened into one vector.
         grid = img_size // 8
+        # [SHARED CONV TRUNK] - the same three convs as encoders / diffusion_policy
         self.conv1 = nn.Conv2d(3, 32, kernel_size=5, stride=2, padding=2)
         self.conv2 = nn.Conv2d(32, 64, kernel_size=3, stride=2, padding=1)
         self.conv3 = nn.Conv2d(64, 128, kernel_size=3, stride=2, padding=1)
@@ -68,15 +72,24 @@ class ACTPolicy(nn.Module):
         self.vae_head = nn.Linear(d_model, latent_dim * 2)
 
     def _memory(self, image, text_ids, state, latent):
+        """Build the encoder's token sequence: [latent, state, text, image tokens...]."""
+        # [SHARED CONV TRUNK] forward pass, matching models/encoders.py
         img = F.relu(self.conv1(image))
         img = F.relu(self.conv2(img))
         img = F.relu(self.conv3(img))
+        # (B, d_model, g, g) -> (B, g*g, d_model): one token per spatial location
         img = self.img_proj(img).flatten(2).transpose(1, 2) + self.img_pos
+        # The three non-image tokens get their own learned positions; the image tokens
+        # already carry img_pos, added above.
         extra = torch.stack([latent, self.state_encoder(state),
                              self.txt_encoder(text_ids)], dim=1) + self.encoder_pos
+
         return self.encoder(torch.cat([extra, img], dim=1))
 
     def _decode(self, memory):
+        """Expand the learnable queries to the batch size and read out actions."""
+        # expand broadcasts without copying - every batch item starts from the same
+        # learned queries
         queries = self.queries.expand(memory.size(0), -1, -1)
         return self.action_head(self.decoder(queries, memory))
 
@@ -87,17 +100,21 @@ class ACTPolicy(nn.Module):
         """
         tokens = torch.cat([self.vae_state(state).unsqueeze(1),
                             self.vae_action(chunk)], dim=1) + self.vae_pos
-        # only the padded actions are masked; the state token is always real
+        # The token sequence is [state, action_1 ... action_N] but is_pad only covers
+        # the actions, so a False column is prepended to leave the state token
+        # unmasked. Inside `src_key_padding_mask`, True means "ignore this position".
         mask = torch.cat([torch.zeros_like(is_pad[:, :1]), is_pad], dim=1)
-        mu, logvar = self.vae_head(self.vae_encoder(tokens, src_key_padding_mask=mask)[:, 0]).chunk(2, dim=-1)
+        enc = self.vae_encoder(tokens, src_key_padding_mask=mask)  # (B, chunk+1, d_model)
+        summary = enc[:, 0]  # attention lets the state token summarise the whole demo
+        mu, logvar = self.vae_head(summary).chunk(2, dim=-1)  # each (B, latent_dim)
 
+        # reparameterisation: sample z ~ N(mu, sigma^2) so gradients reach mu/logvar
         latent = mu + torch.exp(0.5 * logvar) * torch.randn_like(mu)
         pred = self._decode(self._memory(image, text_ids, state, self.latent_proj(latent)))
 
-        # masked L1, and KL to keep the latent near a standard normal
-        valid = ~is_pad.unsqueeze(-1)
-        l1 = (F.l1_loss(pred, chunk, reduction='none') * valid).sum()
-        l1 = l1 / (valid.sum() * chunk.size(-1)).clamp(min=1)
+        l1 = masked_l1_loss(pred, chunk, is_pad)
+        # The KL term pulls the latent towards a standard normal, which is what makes
+        # sampling z = 0 at inference stay in distribution.
         kl = (-0.5 * (1 + logvar - mu.pow(2) - logvar.exp())).sum(-1).mean()
         return l1 + self.kl_weight * kl
 

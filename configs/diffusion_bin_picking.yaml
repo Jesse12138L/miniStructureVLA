@@ -1,32 +1,39 @@
-# 真正的 Diffusion Policy（对齐 real-stanford/diffusion_policy 的结构与数值）。
+# Diffusion Policy on bin-picking-v3, with the structure and the numbers aligned to
+# real-stanford/diffusion_policy. See configs/mlp_bin_picking.yaml for the shared setup.
 policy: diffusion
 
 data:
   dataset_path: data/bp_masked.npz
   save_path: checkpoints/diffusion_bp.pt
   resize_to: 128
-  chunk_size: 16        # 一次预测 16 步，与原版的 horizon 一致
+  # For the diffusion policy chunk_size is the prediction *horizon*, not how many
+  # actions get executed: act() returns just the first n_action_steps of it. 16 matches
+  # the reference's horizon.
+  chunk_size: 16
   normalize: true
 
 model:
   d_model: 128
 
   diffusion:
-    n_action_steps: 8   # 只执行前 8 步就重新规划（原版的 16/8 两段式）
-    # 原版是 [512, 1024, 2048]，U-Net 就有 2.56 亿参数，那是给上百万帧的 Robomimic
-    # 训的。这里取原版一半的宽度：
-    #   条件向量 448 维 / 第一段 256 通道 = 1.8（原版 0.79，之前 [64,...] 时是 7.0）
-    #   参数密度 5876/帧，仍低于原版的约 8500/帧
-    #   训练显存 1.4GB / 6GB，训练时长约 39 分钟（200 epochs）
+    n_action_steps: 8   # execute 8 of the 16 predicted steps, then re-plan (the
+                        # reference's 16/8 split)
+    # The reference uses [512, 1024, 2048], a 256M-parameter U-Net trained on millions of
+    # Robomimic frames. Half that width here:
+    #   conditioning vector 448 dims / 256 channels in the first stage = 1.8
+    #     (the reference sits at 0.79; an earlier [64, ...] was 7.0)
+    #   parameter density 5876 per frame, still below the reference's ~8500
+    #   training memory 1.4GB of 6GB, about 39 minutes for 200 epochs
     down_dims: [256, 512, 1024]
-    num_kp: 32          # spatial softmax 的关键点数，图像特征维 = 2*num_kp
+    num_kp: 32          # spatial-softmax keypoints; the image feature is 2*num_kp wide
     step_embed_dim: 128
 
 train:
   batch_size: 64
-  epochs: 200
+  epochs: 150
   lr: 1.0e-4
   val_split: 0.1
-  use_ema: true         # 维护影子权重，验证和选模型都用它
-  ema_power: 0.75       # 原版的值
+  use_ema: true         # keep a shadow copy of the weights; validation and model
+                        # selection both use it
+  ema_power: 0.75       # the reference's value
   device: cuda
